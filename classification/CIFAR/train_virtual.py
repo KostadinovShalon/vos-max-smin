@@ -54,8 +54,9 @@ parser.add_argument('--sample_number', type=int, default=1000)
 parser.add_argument('--select', type=int, default=1)
 parser.add_argument('--sample_from', type=int, default=10000)
 parser.add_argument('--loss_weight', type=float, default=0.1)
-
-
+parser.add_argument('--root', type=str, default='./data')
+parser.add_argument('--smin_loss_weight', type=float, default=0.0)
+parser.add_argument('--use_conditioning', action='store_true')
 
 args = parser.parse_args()
 
@@ -74,14 +75,13 @@ train_transform = trn.Compose([trn.RandomHorizontalFlip(), trn.RandomCrop(32, pa
 test_transform = trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)])
 
 if args.dataset == 'cifar10':
-    train_data = dset.CIFAR10('/nobackup-slow/dataset/my_xfdu/cifarpy', train=True, transform=train_transform, download=True)
-    test_data = dset.CIFAR10('/nobackup-slow/dataset/my_xfdu/cifarpy', train=False, transform=test_transform, download=True)
+    train_data = dset.CIFAR10(f'{args.root}/cifarpy', train=True, transform=train_transform, download=True)
+    test_data = dset.CIFAR10(f'{args.root}/cifarpy', train=False, transform=test_transform, download=True)
     num_classes = 10
 else:
-    train_data = dset.CIFAR100('/nobackup-slow/dataset/my_xfdu/cifarpy', train=True, transform=train_transform, download=True)
-    test_data = dset.CIFAR100('/nobackup-slow/dataset/my_xfdu/cifarpy', train=False, transform=test_transform, download=True)
+    train_data = dset.CIFAR100(f'{args.root}/cifarpy', train=True, transform=train_transform, download=True)
+    test_data = dset.CIFAR100(f'{args.root}/cifarpy', train=False, transform=test_transform, download=True)
     num_classes = 100
-
 
 calib_indicator = ''
 if args.calibration:
@@ -180,17 +180,18 @@ def log_sum_exp(value, dim=None, keepdim=False):
         # else:
         return m + torch.log(sum_exp)
 
+
 # /////////////// Training ///////////////
 
 def train(epoch):
     net.train()  # enter train mode
     loss_avg = 0.0
+    smin_loss_avg = 0.0
     for data, target in train_loader:
         data, target = data.cuda(), target.cuda()
 
         # forward
         x, output = net.forward_virtual(data)
-
 
         # energy regularization.
         sum_temp = 0
@@ -203,13 +204,13 @@ def train(epoch):
             for index in range(len(target)):
                 dict_key = target_numpy[index]
                 data_dict[dict_key] = torch.cat((data_dict[dict_key][1:],
-                                                      output[index].detach().view(1, -1)), 0)
+                                                 output[index].detach().view(1, -1)), 0)
         elif sum_temp == num_classes * args.sample_number and epoch >= args.start_epoch:
             target_numpy = target.cpu().data.numpy()
             for index in range(len(target)):
                 dict_key = target_numpy[index]
                 data_dict[dict_key] = torch.cat((data_dict[dict_key][1:],
-                                                      output[index].detach().view(1, -1)), 0)
+                                                 output[index].detach().view(1, -1)), 0)
             # the covariance finder needs the data to be centered.
             for index in range(num_classes):
                 if index == 0:
@@ -223,7 +224,6 @@ def train(epoch):
             ## add the variance.
             temp_precision = torch.mm(X.t(), X) / len(X)
             temp_precision += 0.0001 * eye_matrix
-
 
             for index in range(num_classes):
                 new_dis = torch.distributions.multivariate_normal.MultivariateNormal(
@@ -255,8 +255,8 @@ def train(epoch):
                 output1 = logistic_regression(input_for_lr.view(-1, 1))
                 lr_reg_loss = criterion(output1, labels_for_lr.long())
 
-                if epoch % 5 == 0:
-                    print(lr_reg_loss)
+                # if epoch % 5 == 0:
+                #     print(lr_reg_loss)
         else:
             target_numpy = target.cpu().data.numpy()
             for index in range(len(target)):
@@ -271,6 +271,20 @@ def train(epoch):
         loss = F.cross_entropy(x, target)
         # breakpoint()
         loss += args.loss_weight * lr_reg_loss
+
+        if args.smin_loss_weight > 0:
+
+            smin = torch.linalg.svdvals(net.fc.weight)[-1]
+            if args.use_conditioning:
+                smax = torch.linalg.svdvals(net.fc.weight)[0]
+                smin_loss = args.smin_loss_weight * (smax / smin)
+            else:
+                smin_loss = args.smin_loss_weight * (1 / smin)
+
+            loss += smin_loss
+        else:
+            smin_loss = 0
+
         loss.backward()
 
         optimizer.step()
@@ -278,8 +292,10 @@ def train(epoch):
 
         # exponential moving average
         loss_avg = loss_avg * 0.8 + float(loss) * 0.2
+        smin_loss_avg = smin_loss_avg * 0.8 + float(smin_loss) * 0.2
 
     state['train_loss'] = loss_avg
+    state['smin_loss'] = smin_loss_avg
 
 
 # test function
@@ -318,11 +334,12 @@ if not os.path.isdir(args.save):
     raise Exception('%s is not a dir' % args.save)
 
 with open(os.path.join(args.save, args.dataset + calib_indicator + '_' + args.model +
-'_' + str(args.loss_weight) + \
-                             '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
-                            str(args.select) + '_' + str(args.sample_from) +
+                                  '_' + str(args.loss_weight) + \
+                                  '_' + str(args.sample_number) + '_' + str(args.start_epoch) + '_' + \
+                                  str(args.select) + '_' + str(args.sample_from) + \
+                                  f'smin{args.smin_loss_weight}_cond{args.use_conditioning}'  +
                                   '_baseline_training_results.csv'), 'w') as f:
-    f.write('epoch,time(s),train_loss,test_loss,test_error(%)\n')
+    f.write('epoch,time(s),train_loss,smin_losstest_loss,test_error(%)\n')
 
 print('Beginning Training\n')
 
@@ -334,31 +351,33 @@ for epoch in range(start_epoch, args.epochs):
 
     train(epoch)
     test()
-
+    model_name = args.dataset + calib_indicator + '_' + args.model + \
+                 '_baseline' + '_' + str(args.loss_weight) + \
+                 '_' + str(args.sample_number) + '_' + str(args.start_epoch) + '_' + \
+                 str(args.select) + '_' + str(args.sample_from) + '_'  + \
+                 f'smin{args.smin_loss_weight}_cond{args.use_conditioning}_' + 'epoch_'
+    prev_path = model_name + str(epoch - 1) + '.pt'
+    model_name = model_name + str(epoch) + '.pt'
     # Save model
-    torch.save(net.state_dict(),
-               os.path.join(args.save, args.dataset + calib_indicator + '_' + args.model +
-                            '_baseline'  + '_' + str(args.loss_weight) + \
-                             '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
-                            str(args.select) + '_' + str(args.sample_from) + '_' + 'epoch_'  + str(epoch) + '.pt'))
+    torch.save(net.state_dict(), os.path.join(args.save, model_name))
     # Let us not waste space and delete the previous model
-    prev_path = os.path.join(args.save, args.dataset + calib_indicator + '_' + args.model +
-                             '_baseline' + '_' + str(args.loss_weight) + \
-                             '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
-                            str(args.select) + '_' + str(args.sample_from)  + '_' + 'epoch_' + str(epoch - 1) + '.pt')
-    if os.path.exists(prev_path): os.remove(prev_path)
+    prev_path = os.path.join(args.save, prev_path)
+    if os.path.exists(prev_path):
+        os.remove(prev_path)
 
     # Show results
 
     with open(os.path.join(args.save, args.dataset + calib_indicator + '_' + args.model +
                                       '_' + str(args.loss_weight) + \
                                       '_' + str(args.sample_number) + '_' + str(args.start_epoch) + '_' + \
-                                      str(args.select) + '_' + str(args.sample_from) +
-                                      '_baseline_training_results.csv'), 'a') as f:
-        f.write('%03d,%05d,%0.6f,%0.5f,%0.2f\n' % (
+                                      str(args.select) + '_' + str(args.sample_from) + \
+                                      f'smin{args.smin_loss_weight}_cond{args.use_conditioning}' +
+                                      '_baseline_training_results.csv'), 'w') as f:
+        f.write('%03d,%05d,%0.6f,%0.6f,%0.5f,%0.2f\n' % (
             (epoch + 1),
             time.time() - begin_epoch,
             state['train_loss'],
+            state['smin_loss'],
             state['test_loss'],
             100 - 100. * state['test_accuracy'],
         ))
@@ -366,10 +385,11 @@ for epoch in range(start_epoch, args.epochs):
     # # print state with rounded decimals
     # print({k: round(v, 4) if isinstance(v, float) else v for k, v in state.items()})
 
-    print('Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Test Loss {3:.3f} | Test Error {4:.2f}'.format(
+    print('Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Smin Loss {3:.4f} | Test Loss {4:.3f} | Test Error {5:.2f}'.format(
         (epoch + 1),
         int(time.time() - begin_epoch),
         state['train_loss'],
+        state['smin_loss'],
         state['test_loss'],
         100 - 100. * state['test_accuracy'])
     )

@@ -1,0 +1,24 @@
+# Create the .gitignore for PyCharm
+# Add the following lines to the .gitignore file
+.idea/
+*.iml
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.egg-info/
+dist/
+build/
+*.egg
+*.log
+*.swp
+*.tmp
+*.bak
+*.cache
+*.sublime-workspace
+*.sublime-project
+*.vscode/
+*.csv
+*.pt
+
+classification/CIFAR/data/

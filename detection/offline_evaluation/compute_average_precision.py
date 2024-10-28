@@ -58,7 +58,7 @@ def main(args, cfg=None):
                                for i, optimal_f1_score_i in enumerate(optimal_f1_score)]
     optimal_score_threshold = np.array(optimal_score_threshold)
     optimal_score_threshold = optimal_score_threshold[optimal_score_threshold != 0]
-    optimal_score_threshold = optimal_score_threshold.mean()
+    optimal_score_threshold = optimal_score_threshold.mean().item()
 
     print("Classification Score at Optimal F-1 Score: {}".format(optimal_score_threshold))
 

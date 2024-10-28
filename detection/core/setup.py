@@ -181,6 +181,11 @@ def setup_config(args, random_seed=None, is_testing=False, ood=False):
     add_probabilistic_config(cfg)
     # add_hrnet_config(cfg)
 
+    # Add SVD min config
+    cfg.MODEL.ROI_BOX_HEAD.MAX_SMIN_WEIGHT_LOSS = 0.0
+    cfg.MODEL.ROI_BOX_HEAD.SMIN_LEARN_STYLE = 'negative'  # 'negative' or 'inverse'
+    cfg.MODEL.ROI_BOX_HEAD.STARTING_SMIN_REG_EPOCH = 0
+
     # Update default config file with custom config file
     configs_dir = core.configs_dir()
     args.config_file = os.path.join(configs_dir, args.config_file)

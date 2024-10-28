@@ -484,6 +484,9 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
         keypoint_pooler: Optional[ROIPooler] = None,
         keypoint_head: Optional[nn.Module] = None,
         train_on_pred_boxes: bool = False,
+        max_smin_weight_loss: float = 0.,
+        smin_learn_style: str = 'inverse',
+        starting_smin_reg_epoch=0,
         **kwargs
     ):
         """
@@ -534,6 +537,10 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
         self.logistic_regression.cuda()
         # torch.nn.init.xavier_normal_(self.logistic_regression.weight)
 
+        self.max_smin_weight_loss = max_smin_weight_loss
+        assert smin_learn_style in ['negative', 'inverse'], 'smin_learn_style should be negative or inverse'
+        self.smin_learn_style = smin_learn_style
+        self.starting_smin_reg_epoch = starting_smin_reg_epoch
         self.select = 1
         self.sample_from = 10000
         self.loss_weight = 0.1
@@ -552,6 +559,9 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
         ret = super().from_config(cfg)
         cls.cfg = cfg
         ret["train_on_pred_boxes"] = cfg.MODEL.ROI_BOX_HEAD.TRAIN_ON_PRED_BOXES
+        ret['max_smin_weight_loss'] = cfg.MODEL.ROI_BOX_HEAD.MAX_SMIN_WEIGHT_LOSS
+        ret['smin_learn_style'] = cfg.MODEL.ROI_BOX_HEAD.SMIN_LEARN_STYLE
+        ret['starting_smin_reg_epoch'] = cfg.MODEL.ROI_BOX_HEAD.STARTING_SMIN_REG_EPOCH
         # Subclasses that have not been updated to use from_config style construction
         # may have overridden _init_*_head methods. In this case, those overridden methods
         # will not be classmethods and we need to avoid trying to call them here.
@@ -694,6 +704,16 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
             # predicted by the box head.
             losses.update(self._forward_mask(features, proposals))
             losses.update(self._forward_keypoint(features, proposals))
+
+            if self.max_smin_weight_loss > 0:
+                if iteration >= self.starting_smin_reg_epoch:
+                    smin = torch.linalg.svdvals(self.box_predictor.cls_score.weight)[-1]
+                    if self.smin_learn_style == 'negative':
+                        losses['smin_weight_loss'] = - self.max_smin_weight_loss * smin ** 2
+                    else:
+                        losses['smin_weight_loss'] = self.max_smin_weight_loss * (1 / smin)
+                else:
+                    losses['smin_weight_loss'] = torch.zeros(1).cuda()
             return proposals, losses
         else:
             pred_instances = self._forward_box(features, proposals)
