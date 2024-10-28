@@ -9,6 +9,8 @@ import torch.backends.cudnn as cudnn
 import torchvision.transforms as trn
 import torchvision.datasets as dset
 import torch.nn.functional as F
+from FrEIA.framework import InputNode, Node, OutputNode, GraphINN
+from FrEIA.modules import GLOWCouplingBlock, PermuteRandom
 from tqdm import tqdm
 from models.allconv import AllConvNet
 from models.wrn_virtual import WideResNet
@@ -57,6 +59,7 @@ parser.add_argument('--loss_weight', type=float, default=0.1)
 parser.add_argument('--root', type=str, default='./data')
 parser.add_argument('--smin_loss_weight', type=float, default=0.0)
 parser.add_argument('--use_conditioning', action='store_true')
+parser.add_argument('--use_ffs', action='store_true')
 
 args = parser.parse_args()
 
@@ -101,6 +104,53 @@ if args.model == 'allconv':
 else:
     net = WideResNet(args.layers, num_classes, args.widen_factor, dropRate=args.droprate)
 
+
+def subnet_fc(c_in, c_out):
+    return nn.Sequential(nn.Linear(c_in, 2048), nn.ReLU(), nn.Linear(2048, c_out))
+
+
+def NLLLoss(z, sldj):
+    """Negative log-likelihood loss assuming isotropic gaussian with unit norm.
+      Args:
+         k (int or float): Number of discrete values in each input dimension.
+            E.g., `k` is 256 for natural images.
+      See Also:
+          Equation (3) in the RealNVP paper: https://arxiv.org/abs/1605.08803
+    """
+    prior_ll = -0.5 * (z ** 2 + np.log(2 * np.pi))
+    prior_ll = prior_ll.flatten(1).sum(-1) - np.log(256) * np.prod(z.size()[1:])
+    ll = prior_ll + sldj
+    nll = -ll.mean()
+    return nll
+
+
+def NLL(z, sldj):
+    """Negative log-likelihood loss assuming isotropic gaussian with unit norm.
+      Args:
+         k (int or float): Number of discrete values in each input dimension.
+            E.g., `k` is 256 for natural images.
+      See Also:
+          Equation (3) in the RealNVP paper: https://arxiv.org/abs/1605.08803
+    """
+    prior_ll = -0.5 * (z ** 2 + np.log(2 * np.pi))
+    prior_ll = prior_ll.flatten(1).sum(-1) - np.log(256) * np.prod(z.size()[1:])
+    ll = prior_ll + sldj
+    nll = -ll
+    return nll
+
+
+flow_model = None
+if args.use_ffs:
+    in1 = InputNode(net.nChannels, name='input1')
+    layer1 = Node(in1, GLOWCouplingBlock, {'subnet_constructor': subnet_fc, 'clamp': 2.0},
+                  name=F'coupling_{0}')
+    layer2 = Node(layer1, PermuteRandom, {'seed': 0}, name=F'permute_{0}')
+    layer3 = Node(layer2, GLOWCouplingBlock, {'subnet_constructor': subnet_fc, 'clamp': 2.0},
+                  name=F'coupling_{1}')
+    layer4 = Node(layer3, PermuteRandom, {'seed': 1}, name=F'permute_{1}')
+    out1 = OutputNode(layer4, name='output1')
+    flow_model = GraphINN([in1, layer1, layer2, layer3, layer4, out1])
+
 start_epoch = 0
 
 # Restore model if desired
@@ -121,6 +171,8 @@ if args.ngpu > 1:
 
 if args.ngpu > 0:
     net.cuda()
+    if flow_model is not None:
+        flow_model.cuda()
     torch.cuda.manual_seed(1)
 
 cudnn.benchmark = True  # fire on all cylinders
@@ -187,6 +239,7 @@ def train(epoch):
     net.train()  # enter train mode
     loss_avg = 0.0
     smin_loss_avg = 0.0
+    nll_loss_avg = 0.0
     for data, target in train_loader:
         data, target = data.cuda(), target.cuda()
 
@@ -198,46 +251,72 @@ def train(epoch):
         for index in range(num_classes):
             sum_temp += number_dict[index]
         lr_reg_loss = torch.zeros(1).cuda()[0]
+        ########################################################################################
+
+        #############################    Flow Feature Synthesis      ###########################
+        ########################################################################################
+        nll_loss = torch.zeros(1).cuda()[0]
         if sum_temp == num_classes * args.sample_number and epoch < args.start_epoch:
             # maintaining an ID data queue for each class.
             target_numpy = target.cpu().data.numpy()
-            for index in range(len(target)):
-                dict_key = target_numpy[index]
-                data_dict[dict_key] = torch.cat((data_dict[dict_key][1:],
-                                                 output[index].detach().view(1, -1)), 0)
+            if args.use_ffs:
+                z, sldj = flow_model(output.detach().cuda())
+                nll_loss = NLLLoss(z, sldj)
+            else:
+                for index in range(len(target)):
+                    dict_key = target_numpy[index]
+                    data_dict[dict_key] = torch.cat((data_dict[dict_key][1:],
+                                                     output[index].detach().view(1, -1)), 0)
         elif sum_temp == num_classes * args.sample_number and epoch >= args.start_epoch:
-            target_numpy = target.cpu().data.numpy()
-            for index in range(len(target)):
-                dict_key = target_numpy[index]
-                data_dict[dict_key] = torch.cat((data_dict[dict_key][1:],
-                                                 output[index].detach().view(1, -1)), 0)
-            # the covariance finder needs the data to be centered.
-            for index in range(num_classes):
-                if index == 0:
-                    X = data_dict[index] - data_dict[index].mean(0)
-                    mean_embed_id = data_dict[index].mean(0).view(1, -1)
-                else:
-                    X = torch.cat((X, data_dict[index] - data_dict[index].mean(0)), 0)
-                    mean_embed_id = torch.cat((mean_embed_id,
-                                               data_dict[index].mean(0).view(1, -1)), 0)
+            if args.use_ffs:
+                z, sldj = flow_model(output.detach().cuda())
+                nll_loss = NLLLoss(z, sldj)
 
-            ## add the variance.
-            temp_precision = torch.mm(X.t(), X) / len(X)
-            temp_precision += 0.0001 * eye_matrix
+                # randomly sample from latent space of flow model
+                with torch.no_grad():
+                    z_randn = torch.randn((args.sample_from, 1024), dtype=torch.float32).cuda()
+                    negative_samples, _ = flow_model(z_randn, rev=True)
+                    # negative_samples = torch.sigmoid(negative_samples)
+                    _, sldj_neg = flow_model(negative_samples)
+                    nll_neg = NLL(z_randn, sldj_neg)
+                    cur_samples, index_prob = torch.topk(nll_neg, args.select)
+                    ood_samples = negative_samples[index_prob].view(1, -1)
+                    # ood_samples = torch.squeeze(ood_samples)
+                    del negative_samples
+                    del z_randn
+            else:
+                target_numpy = target.cpu().data.numpy()
+                for index in range(len(target)):
+                    dict_key = target_numpy[index]
+                    data_dict[dict_key] = torch.cat((data_dict[dict_key][1:],
+                                                     output[index].detach().view(1, -1)), 0)
+                # the covariance finder needs the data to be centered.
+                for index in range(num_classes):
+                    if index == 0:
+                        X = data_dict[index] - data_dict[index].mean(0)
+                        mean_embed_id = data_dict[index].mean(0).view(1, -1)
+                    else:
+                        X = torch.cat((X, data_dict[index] - data_dict[index].mean(0)), 0)
+                        mean_embed_id = torch.cat((mean_embed_id,
+                                                   data_dict[index].mean(0).view(1, -1)), 0)
 
-            for index in range(num_classes):
-                new_dis = torch.distributions.multivariate_normal.MultivariateNormal(
-                    mean_embed_id[index], covariance_matrix=temp_precision)
-                negative_samples = new_dis.rsample((args.sample_from,))
-                prob_density = new_dis.log_prob(negative_samples)
-                # breakpoint()
-                # index_prob = (prob_density < - self.threshold).nonzero().view(-1)
-                # keep the data in the low density area.
-                cur_samples, index_prob = torch.topk(- prob_density, args.select)
-                if index == 0:
-                    ood_samples = negative_samples[index_prob]
-                else:
-                    ood_samples = torch.cat((ood_samples, negative_samples[index_prob]), 0)
+                ## add the variance.
+                temp_precision = torch.mm(X.t(), X) / len(X)
+                temp_precision += 0.0001 * eye_matrix
+
+                for index in range(num_classes):
+                    new_dis = torch.distributions.multivariate_normal.MultivariateNormal(
+                        mean_embed_id[index], covariance_matrix=temp_precision)
+                    negative_samples = new_dis.rsample((args.sample_from,))
+                    prob_density = new_dis.log_prob(negative_samples)
+                    # breakpoint()
+                    # index_prob = (prob_density < - self.threshold).nonzero().view(-1)
+                    # keep the data in the low density area.
+                    cur_samples, index_prob = torch.topk(- prob_density, args.select)
+                    if index == 0:
+                        ood_samples = negative_samples[index_prob]
+                    else:
+                        ood_samples = torch.cat((ood_samples, negative_samples[index_prob]), 0)
             if len(ood_samples) != 0:
                 # add some gaussian noise
                 # ood_samples = self.noise(ood_samples)
@@ -271,6 +350,7 @@ def train(epoch):
         loss = F.cross_entropy(x, target)
         # breakpoint()
         loss += args.loss_weight * lr_reg_loss
+        loss += nll_loss * 1e-4
 
         if args.smin_loss_weight > 0:
 
@@ -293,9 +373,11 @@ def train(epoch):
         # exponential moving average
         loss_avg = loss_avg * 0.8 + float(loss) * 0.2
         smin_loss_avg = smin_loss_avg * 0.8 + float(smin_loss) * 0.2
+        nll_loss_avg = nll_loss_avg * 0.8 + float(nll_loss * 1e-4) * 0.2
 
     state['train_loss'] = loss_avg
     state['smin_loss'] = smin_loss_avg
+    state['nll_loss'] = nll_loss_avg
 
 
 # test function
@@ -333,13 +415,18 @@ if not os.path.exists(args.save):
 if not os.path.isdir(args.save):
     raise Exception('%s is not a dir' % args.save)
 
-with open(os.path.join(args.save, args.dataset + calib_indicator + '_' + args.model +
-                                  '_' + str(args.loss_weight) + \
-                                  '_' + str(args.sample_number) + '_' + str(args.start_epoch) + '_' + \
-                                  str(args.select) + '_' + str(args.sample_from) + \
-                                  f'smin{args.smin_loss_weight}_cond{args.use_conditioning}'  +
-                                  '_baseline_training_results.csv'), 'w') as f:
-    f.write('epoch,time(s),train_loss,smin_losstest_loss,test_error(%)\n')
+fn = args.dataset + calib_indicator + '_' + args.model + \
+                             '_' + str(args.loss_weight) + \
+                             '_' + str(args.sample_number) + '_' + str(args.start_epoch) + '_' + \
+                             str(args.select) + '_' + str(args.sample_from)
+if args.smin_loss_weight > 0:
+    fn += f'_smin{args.smin_loss_weight}_cond{args.use_conditioning}'
+if args.use_ffs:
+    fn += '_ffs'
+csv_file_name = os.path.join(args.save, fn + '_baseline_training_results.csv')
+
+with open(csv_file_name, 'w') as f:
+    f.write('epoch,time(s),train_loss,smin_loss_test_loss,test_error(%)\n')
 
 print('Beginning Training\n')
 
@@ -354,8 +441,12 @@ for epoch in range(start_epoch, args.epochs):
     model_name = args.dataset + calib_indicator + '_' + args.model + \
                  '_baseline' + '_' + str(args.loss_weight) + \
                  '_' + str(args.sample_number) + '_' + str(args.start_epoch) + '_' + \
-                 str(args.select) + '_' + str(args.sample_from) + '_'  + \
-                 f'smin{args.smin_loss_weight}_cond{args.use_conditioning}_' + 'epoch_'
+                 str(args.select) + '_' + str(args.sample_from)
+    if args.smin_loss_weight > 0:
+        model_name += f'_smin{args.smin_loss_weight}_cond{args.use_conditioning}'
+    if args.use_ffs:
+        model_name += '_ffs'
+    model_name += '_epoch_'
     prev_path = model_name + str(epoch - 1) + '.pt'
     model_name = model_name + str(epoch) + '.pt'
     # Save model
@@ -367,17 +458,13 @@ for epoch in range(start_epoch, args.epochs):
 
     # Show results
 
-    with open(os.path.join(args.save, args.dataset + calib_indicator + '_' + args.model +
-                                      '_' + str(args.loss_weight) + \
-                                      '_' + str(args.sample_number) + '_' + str(args.start_epoch) + '_' + \
-                                      str(args.select) + '_' + str(args.sample_from) + \
-                                      f'smin{args.smin_loss_weight}_cond{args.use_conditioning}' +
-                                      '_baseline_training_results.csv'), 'w') as f:
-        f.write('%03d,%05d,%0.6f,%0.6f,%0.5f,%0.2f\n' % (
+    with open(csv_file_name, 'w') as f:
+        f.write('%03d,%05d,%0.6f,%0.6f,%0.6f,%0.5f,%0.2f\n' % (
             (epoch + 1),
             time.time() - begin_epoch,
             state['train_loss'],
             state['smin_loss'],
+            state['nll_loss'],
             state['test_loss'],
             100 - 100. * state['test_accuracy'],
         ))
@@ -385,11 +472,13 @@ for epoch in range(start_epoch, args.epochs):
     # # print state with rounded decimals
     # print({k: round(v, 4) if isinstance(v, float) else v for k, v in state.items()})
 
-    print('Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Smin Loss {3:.4f} | Test Loss {4:.3f} | Test Error {5:.2f}'.format(
-        (epoch + 1),
-        int(time.time() - begin_epoch),
-        state['train_loss'],
-        state['smin_loss'],
-        state['test_loss'],
-        100 - 100. * state['test_accuracy'])
+    print(
+        'Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Smin Loss {3:.4f} | NLL Loss {4:.4f} | Test Loss {5:.3f} | Test Error {6:.2f}'.format(
+            (epoch + 1),
+            int(time.time() - begin_epoch),
+            state['train_loss'],
+            state['smin_loss'],
+            state['nll_loss'],
+            state['test_loss'],
+            100 - 100. * state['test_accuracy'])
     )
