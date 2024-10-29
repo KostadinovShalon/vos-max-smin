@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
-import numpy as np
-import os
 import argparse
+import os
+import random
 import time
+
+import numpy as np
 import torch
-import torch.nn as nn
 import torch.backends.cudnn as cudnn
-import torchvision.transforms as trn
-import torchvision.datasets as dset
+import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.datasets as dset
+import torchvision.transforms as trn
 from FrEIA.framework import InputNode, Node, OutputNode, GraphINN
 from FrEIA.modules import GLOWCouplingBlock, PermuteRandom
-from tqdm import tqdm
+
 from models.allconv import AllConvNet
 from models.wrn_virtual import WideResNet
 
@@ -60,14 +62,24 @@ parser.add_argument('--root', type=str, default='./data')
 parser.add_argument('--smin_loss_weight', type=float, default=0.0)
 parser.add_argument('--use_conditioning', action='store_true')
 parser.add_argument('--use_ffs', action='store_true')
+parser.add_argument('--null_space_red_dim', type=int, default=-1)
 
 args = parser.parse_args()
-
 state = {k: v for k, v in args._get_kwargs()}
 print(state)
 
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+g = torch.Generator()
+g.manual_seed(0)
+
+
 torch.manual_seed(1)
 np.random.seed(1)
+random.seed(0)
 
 # mean and standard deviation of channels of CIFAR-10 images
 mean = [x / 255 for x in [125.3, 123.0, 113.9]]
@@ -93,17 +105,22 @@ if args.calibration:
 
 train_loader = torch.utils.data.DataLoader(
     train_data, batch_size=args.batch_size, shuffle=True,
-    num_workers=args.prefetch, pin_memory=True)
+    num_workers=args.prefetch, pin_memory=True, generator=g,
+worker_init_fn=seed_worker,)
 test_loader = torch.utils.data.DataLoader(
     test_data, batch_size=args.test_bs, shuffle=False,
-    num_workers=args.prefetch, pin_memory=True)
+    num_workers=args.prefetch, pin_memory=True, generator=g,
+worker_init_fn=seed_worker,)
 
 # Create model
 if args.model == 'allconv':
     net = AllConvNet(num_classes)
 else:
-    net = WideResNet(args.layers, num_classes, args.widen_factor, dropRate=args.droprate)
+    net = WideResNet(args.layers, num_classes, args.widen_factor, dropRate=args.droprate,
+                     null_space_red_dim=args.null_space_red_dim)
 
+if args.null_space_red_dim > 0:
+    args.model = f'{args.model}_nsr{args.null_space_red_dim}'
 
 def subnet_fc(c_in, c_out):
     return nn.Sequential(nn.Linear(c_in, 2048), nn.ReLU(), nn.Linear(2048, c_out))
@@ -175,7 +192,8 @@ if args.ngpu > 0:
         flow_model.cuda()
     torch.cuda.manual_seed(1)
 
-cudnn.benchmark = True  # fire on all cylinders
+cudnn.deterministic = True
+cudnn.benchmark = False  # fire on all cylinders
 
 if args.dataset == 'cifar10':
     num_classes = 10
@@ -183,11 +201,12 @@ else:
     num_classes = 100
 weight_energy = torch.nn.Linear(num_classes, 1).cuda()
 torch.nn.init.uniform_(weight_energy.weight)
-data_dict = torch.zeros(num_classes, args.sample_number, 128).cuda()
+n_fts = net.nChannels if args.null_space_red_dim <= 0 else args.null_space_red_dim
+data_dict = torch.zeros(num_classes, args.sample_number, n_fts).cuda()
 number_dict = {}
 for i in range(num_classes):
     number_dict[i] = 0
-eye_matrix = torch.eye(128, device='cuda')
+eye_matrix = torch.eye(n_fts, device='cuda')
 logistic_regression = torch.nn.Linear(1, 2)
 logistic_regression = logistic_regression.cuda()
 optimizer = torch.optim.SGD(
@@ -215,7 +234,6 @@ def log_sum_exp(value, dim=None, keepdim=False):
 
     value.exp().sum(dim, keepdim).log()
     """
-    import math
     # TODO: torch.max(value, dim=None) threw an error at time of writing
     if dim is not None:
         m, _ = torch.max(value, dim=dim, keepdim=True)
@@ -322,7 +340,10 @@ def train(epoch):
                 # ood_samples = self.noise(ood_samples)
                 # energy_score_for_fg = 1 * torch.logsumexp(predictions[0][selected_fg_samples][:, :-1] / 1, 1)
                 energy_score_for_fg = log_sum_exp(x, 1)
-                predictions_ood = net.fc(ood_samples)
+                if args.null_space_red_dim > 0:
+                    predictions_ood = net.fc[2](ood_samples)
+                else:
+                    predictions_ood = net.fc(ood_samples)
                 # energy_score_for_bg = 1 * torch.logsumexp(predictions_ood[0][:, :-1] / 1, 1)
                 energy_score_for_bg = log_sum_exp(predictions_ood, 1)
 
@@ -353,10 +374,10 @@ def train(epoch):
         loss += nll_loss * 1e-4
 
         if args.smin_loss_weight > 0:
-
-            smin = torch.linalg.svdvals(net.fc.weight)[-1]
+            fcw = net.fc.weight if args.null_space_red_dim <= 0 else net.fc[2].weight
+            smin = torch.linalg.svdvals(fcw)[-1]
             if args.use_conditioning:
-                smax = torch.linalg.svdvals(net.fc.weight)[0]
+                smax = torch.linalg.svdvals(fcw)[0]
                 smin_loss = args.smin_loss_weight * (smax / smin)
             else:
                 smin_loss = args.smin_loss_weight * (1 / smin)

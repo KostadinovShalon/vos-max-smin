@@ -54,7 +54,7 @@ class NetworkBlock(nn.Module):
 
 
 class WideResNet(nn.Module):
-    def __init__(self, depth, num_classes, widen_factor=1, dropRate=0.0):
+    def __init__(self, depth, num_classes, widen_factor=1, dropRate=0.0, null_space_red_dim=-1):
         super(WideResNet, self).__init__()
         nChannels = [16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor]
         assert ((depth - 4) % 6 == 0)
@@ -72,7 +72,17 @@ class WideResNet(nn.Module):
         # global average pooling and classifier
         self.bn1 = nn.BatchNorm2d(nChannels[3])
         self.relu = nn.ReLU(inplace=True)
-        self.fc = nn.Linear(nChannels[3], num_classes)
+        # Assert xor of v2, v3
+        self.null_space_red_dim = null_space_red_dim
+        if null_space_red_dim <= 0:
+            self.fc = nn.Linear(nChannels[3], num_classes)
+        else:
+            self.fc = nn.Sequential(
+                nn.Linear(nChannels[3], null_space_red_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(null_space_red_dim, num_classes))
+            self.fc[0].bias.data.zero_()
+            self.fc[2].bias.data.zero_()
         self.nChannels = nChannels[3]
 
         for m in self.modules():
@@ -103,6 +113,10 @@ class WideResNet(nn.Module):
         out = self.relu(self.bn1(out))
         out = F.avg_pool2d(out, 8)
         out = out.view(-1, self.nChannels)
+        if self.null_space_red_dim > 0:
+            out = self.fc[0](out)
+            out = self.fc[1](out)
+            return self.fc[2](out), out
         return self.fc(out), out
 
     def intermediate_forward(self, x, layer_index):
