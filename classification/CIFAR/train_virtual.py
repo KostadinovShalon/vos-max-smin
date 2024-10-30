@@ -126,6 +126,13 @@ def subnet_fc(c_in, c_out):
     return nn.Sequential(nn.Linear(c_in, 2048), nn.ReLU(), nn.Linear(2048, c_out))
 
 
+if args.dataset == 'cifar10':
+    num_classes = 10
+else:
+    num_classes = 100
+
+n_fts = net.nChannels if args.null_space_red_dim <= 0 else args.null_space_red_dim
+
 def NLLLoss(z, sldj):
     """Negative log-likelihood loss assuming isotropic gaussian with unit norm.
       Args:
@@ -158,7 +165,7 @@ def NLL(z, sldj):
 
 flow_model = None
 if args.use_ffs:
-    in1 = InputNode(net.nChannels, name='input1')
+    in1 = InputNode(n_fts, name='input1')
     layer1 = Node(in1, GLOWCouplingBlock, {'subnet_constructor': subnet_fc, 'clamp': 2.0},
                   name=F'coupling_{0}')
     layer2 = Node(layer1, PermuteRandom, {'seed': 0}, name=F'permute_{0}')
@@ -195,13 +202,8 @@ if args.ngpu > 0:
 cudnn.deterministic = True
 cudnn.benchmark = False  # fire on all cylinders
 
-if args.dataset == 'cifar10':
-    num_classes = 10
-else:
-    num_classes = 100
 weight_energy = torch.nn.Linear(num_classes, 1).cuda()
 torch.nn.init.uniform_(weight_energy.weight)
-n_fts = net.nChannels if args.null_space_red_dim <= 0 else args.null_space_red_dim
 data_dict = torch.zeros(num_classes, args.sample_number, n_fts).cuda()
 number_dict = {}
 for i in range(num_classes):

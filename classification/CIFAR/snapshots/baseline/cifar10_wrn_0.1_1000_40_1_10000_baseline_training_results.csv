@@ -1,2 +1,1 @@
-epoch,time(s),train_loss,test_loss,test_error(%)
-001,00022,1.311726,1.27783,45.61
+epoch,time(s),train_loss,smin_loss_test_loss,test_error(%)
