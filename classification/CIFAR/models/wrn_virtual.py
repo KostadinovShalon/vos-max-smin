@@ -2,6 +2,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.models import ResNet
+from torchvision.models.resnet import Bottleneck
 
 
 class BasicBlock(nn.Module):
@@ -138,4 +140,37 @@ class WideResNet(nn.Module):
         out = F.avg_pool2d(out, 8)
         out = out.view(-1, self.nChannels)
         return self.fc(out), out_list
-         
+
+
+class VirtualResNet50(ResNet):
+    def __init__(self, num_classes, null_space_red_dim=-1):
+        super().__init__(block=Bottleneck, layers=[3, 4, 6, 3], num_classes=num_classes)
+        self.null_space_red_dim = null_space_red_dim
+        if null_space_red_dim > 0:
+            self.fc = nn.Sequential(
+                nn.Linear(512 * Bottleneck.expansion, null_space_red_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(null_space_red_dim, num_classes))
+        self.nChannels = 512 * Bottleneck.expansion
+
+    def forward_virtual(self, x):
+        # See note [TorchScript super()]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        # x = self.fc(x)
+        if self.null_space_red_dim > 0:
+            x = self.fc[0](x)
+            x = self.fc[1](x)
+            return self.fc[2](x), x
+
+        return self.fc(x), x

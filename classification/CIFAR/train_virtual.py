@@ -15,7 +15,7 @@ from FrEIA.framework import InputNode, Node, OutputNode, GraphINN
 from FrEIA.modules import GLOWCouplingBlock, PermuteRandom
 
 from models.allconv import AllConvNet
-from models.wrn_virtual import WideResNet
+from models.wrn_virtual import WideResNet, VirtualResNet50
 
 # go through rigamaroo to do ...utils.display_results import show_performance
 if __package__ is None:
@@ -27,11 +27,10 @@ if __package__ is None:
 
 parser = argparse.ArgumentParser(description='Trains a CIFAR Classifier',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('--dataset', type=str, choices=['cifar10', 'cifar100'],
-                    default='cifar10',
-                    help='Choose between CIFAR-10, CIFAR-100.')
+parser.add_argument('--dataset', type=str, choices=['cifar10', 'cifar100', 'imagenet-1k', 'imagenet-100'],
+                    help='Choose between CIFAR-10, CIFAR-100, Imagenet-100, Imagenet-1k.')
 parser.add_argument('--model', '-m', type=str, default='wrn',
-                    choices=['allconv', 'wrn'], help='Choose architecture.')
+                    choices=['allconv', 'wrn', 'rn50'], help='Choose architecture.')
 parser.add_argument('--calibration', '-c', action='store_true',
                     help='Train a model to be used for calibration. This holds out some data for validation.')
 # Optimization options
@@ -88,15 +87,38 @@ std = [x / 255 for x in [63.0, 62.1, 66.7]]
 train_transform = trn.Compose([trn.RandomHorizontalFlip(), trn.RandomCrop(32, padding=4),
                                trn.ToTensor(), trn.Normalize(mean, std)])
 test_transform = trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)])
+in_train_transform = trn.Compose([
+        trn.Resize(size=224, interpolation=trn.InterpolationMode.BICUBIC),
+        trn.RandomResizedCrop(size=(224, 224), scale=(0.5, 1), interpolation=trn.InterpolationMode.BICUBIC),
+        trn.RandomHorizontalFlip(p=0.5),
+        trn.ToTensor(),
+        trn.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+    ])
+in_test_transform = trn.Compose([
+    trn.Resize(size=(224, 224), interpolation=trn.InterpolationMode.BICUBIC),
+    trn.CenterCrop(size=(224, 224)),
+    trn.ToTensor(),
+    trn.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+])
 
 if args.dataset == 'cifar10':
     train_data = dset.CIFAR10(f'{args.root}/cifarpy', train=True, transform=train_transform, download=True)
     test_data = dset.CIFAR10(f'{args.root}/cifarpy', train=False, transform=test_transform, download=True)
     num_classes = 10
-else:
+elif args.dataset == 'cifar100':
     train_data = dset.CIFAR100(f'{args.root}/cifarpy', train=True, transform=train_transform, download=True)
     test_data = dset.CIFAR100(f'{args.root}/cifarpy', train=False, transform=test_transform, download=True)
     num_classes = 100
+elif args.dataset == 'imagenet-1k':
+    train_data = dset.ImageFolder(f'{args.root}/imagenet-1k/train', transform=in_train_transform)
+    test_data = dset.ImageFolder(f'{args.root}/imagenet-1k/val', transform=in_test_transform)
+    num_classes = 1000
+elif args.dataset == 'imagenet-100':
+    train_data = dset.ImageFolder(f'{args.root}/imagenet-100/train', transform=in_train_transform)
+    test_data = dset.ImageFolder(f'{args.root}/imagenet-100/val', transform=in_test_transform)
+    num_classes = 100
+else:
+    raise ValueError('Unknown dataset')
 
 calib_indicator = ''
 if args.calibration:
@@ -106,15 +128,17 @@ if args.calibration:
 train_loader = torch.utils.data.DataLoader(
     train_data, batch_size=args.batch_size, shuffle=True,
     num_workers=args.prefetch, pin_memory=True, generator=g,
-worker_init_fn=seed_worker,)
+    worker_init_fn=seed_worker,)
 test_loader = torch.utils.data.DataLoader(
     test_data, batch_size=args.test_bs, shuffle=False,
     num_workers=args.prefetch, pin_memory=True, generator=g,
-worker_init_fn=seed_worker,)
+    worker_init_fn=seed_worker,)
 
 # Create model
 if args.model == 'allconv':
     net = AllConvNet(num_classes)
+elif args.model == 'rn50':
+    net = VirtualResNet50(num_classes, null_space_red_dim=args.null_space_red_dim)
 else:
     net = WideResNet(args.layers, num_classes, args.widen_factor, dropRate=args.droprate,
                      null_space_red_dim=args.null_space_red_dim)
