@@ -54,7 +54,7 @@ parser.add_argument('--calibration', '-c', action='store_true',
 parser.add_argument('--epochs', '-e', type=int, default=100, help='Number of epochs to train.')
 parser.add_argument('--learning_rate', '-lr', type=float, default=0.1, help='The initial learning rate.')
 parser.add_argument('--batch_size', '-b', type=int, default=160, help='Batch size.')
-parser.add_argument('--oe_batch_size', type=int, default=256, help='Batch size.')
+parser.add_argument('--oe_batch_size', type=int, default=160, help='Batch size.')
 parser.add_argument('--test_bs', type=int, default=200)
 parser.add_argument('--momentum', type=float, default=0.9, help='Momentum.')
 parser.add_argument('--decay', '-d', type=float, default=0.0005, help='Weight decay (L2 penalty).')
@@ -166,7 +166,8 @@ if args.r50:
     net = ResNet_Model(name='resnet50', num_classes=num_classes, null_space_red_dim=args.null_space_red_dim)
 else:
     net = ResNet_Model(name='resnet34', num_classes=num_classes, null_space_red_dim=args.null_space_red_dim)
-
+for p in net.parameters():
+    p.register_hook(lambda grad: torch.clamp(grad, -35, 35))
 
 def recursion_change_bn(module):
     if isinstance(module, torch.nn.BatchNorm2d):
@@ -273,7 +274,8 @@ def train(epoch):
                 criterion = torch.nn.CrossEntropyLoss()
                 output1 = logistic_regression(input_for_lr.reshape(-1, 1))
                 energy_reg_loss = criterion(output1, binary_labels.long())
-
+                if energy_reg_loss.detach().item() > 35:
+                    print('heeeeey')
                 loss += args.energy_weight * energy_reg_loss
 
             elif args.score == 'OE':
