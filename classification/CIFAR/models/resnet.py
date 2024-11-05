@@ -173,15 +173,21 @@ class LinearBatchNorm(nn.Module):
         return x
 
 
-
-
 class ResNet_Model(nn.Module):
     """encoder + classifier"""
-    def __init__(self, name='resnet50', num_classes=10):
+    def __init__(self, name='resnet50', num_classes=10, null_space_red_dim=-1):
         super(ResNet_Model, self).__init__()
         model_fun, dim_in = model_dict[name]
         self.encoder = model_fun()
-        self.fc = nn.Linear(dim_in, num_classes)
+        self.null_space_red_dim = null_space_red_dim
+        if null_space_red_dim > 0:
+            self.fc = nn.Sequential(
+                nn.Linear(dim_in, null_space_red_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(null_space_red_dim, num_classes))
+        else:
+            self.fc = nn.Linear(dim_in, num_classes)
+
         # from route import RouteDICE
         import numpy as np
         # self.fc = RouteDICE(512, num_classes, p=95,
@@ -196,9 +202,12 @@ class ResNet_Model(nn.Module):
         else:
             return self.fc(self.encoder(x))
 
-
     def forward_repre(self, x):
         encoded = self.encoder(x)
+        if self.null_space_red_dim > 0:
+            encoded = self.fc[0](encoded)
+            encoded = self.fc[1](encoded)
+            return encoded, self.fc[2](encoded)
         return encoded, self.fc(encoded)
 
     def features(self, x):
