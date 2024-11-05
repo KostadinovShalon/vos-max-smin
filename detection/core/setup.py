@@ -159,7 +159,13 @@ def add_probabilistic_config(cfg):
     # vos args.
     _C.VOS.SAMPLE_NUMBER = 1000
     _C.VOS.STARTING_ITER = 12000
+    _C.VOS.SAMPLE_FROM = 10000
+    _C.VOS.USE_FFS = False
 
+    _C.NULL_SPACE = CN()
+    _C.NULL_SPACE.RED_DIM = -1
+    _C.NULL_SPACE.SMIN_LOSS_WEIGHT = 0.0
+    _C.NULL_SPACE.USE_CONDITIONING = False
 
 
 
@@ -181,14 +187,11 @@ def setup_config(args, random_seed=None, is_testing=False, ood=False):
     add_probabilistic_config(cfg)
     # add_hrnet_config(cfg)
 
-    # Add SVD min config
-    cfg.MODEL.ROI_BOX_HEAD.MAX_SMIN_WEIGHT_LOSS = 0.0
-    cfg.MODEL.ROI_BOX_HEAD.SMIN_LEARN_STYLE = 'negative'  # 'negative' or 'inverse'
-    cfg.MODEL.ROI_BOX_HEAD.STARTING_SMIN_REG_EPOCH = 0
-
     # Update default config file with custom config file
     configs_dir = core.configs_dir()
+    print(configs_dir)
     args.config_file = os.path.join(configs_dir, args.config_file)
+    print(args.config_file)
     # breakpoint()
     if ood:
         # breakpoint()

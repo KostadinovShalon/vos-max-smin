@@ -4,6 +4,8 @@ import logging
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 import torch
+from FrEIA.framework import InputNode, Node, OutputNode, GraphINN
+from FrEIA.modules import GLOWCouplingBlock, PermuteRandom
 from torch import nn
 import torch.nn.functional as F
 from sklearn import covariance
@@ -487,6 +489,8 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
         max_smin_weight_loss: float = 0.,
         smin_learn_style: str = 'inverse',
         starting_smin_reg_epoch=0,
+        use_ffs: bool = False,
+        box_head_extension: Optional[nn.Module] = None,
         **kwargs
     ):
         """
@@ -530,8 +534,8 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
         self.train_on_pred_boxes = train_on_pred_boxes
 
         self.sample_number = self.cfg.VOS.SAMPLE_NUMBER
+        self.sample_from = self.cfg.VOS.SAMPLE_FROM
         self.start_iter = self.cfg.VOS.STARTING_ITER
-        # print(self.sample_number, self.start_iter)
 
         self.logistic_regression = torch.nn.Linear(1, 2)
         self.logistic_regression.cuda()
@@ -541,27 +545,41 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
         assert smin_learn_style in ['negative', 'inverse'], 'smin_learn_style should be negative or inverse'
         self.smin_learn_style = smin_learn_style
         self.starting_smin_reg_epoch = starting_smin_reg_epoch
+
+        self.use_ffs = use_ffs
+        # Stack all the coupling blocks including the permute blocks
+        self.ft_dim = 1024 if self.cfg.NULL_SPACE.RED_DIM <= 0 else self.cfg.NULL_SPACE.RED_DIM
+        if self.use_ffs:
+            self.in1 = InputNode(self.ft_dim, name='input1')
+            self.layer1 = Node(self.in1, GLOWCouplingBlock, {'subnet_constructor': self.subnet_fc, 'clamp': 2.0},
+                               name=F'coupling_{0}')
+            self.layer2 = Node(self.layer1, PermuteRandom, {'seed': 0}, name=F'permute_{0}')
+            self.layer3 = Node(self.layer2, GLOWCouplingBlock, {'subnet_constructor': self.subnet_fc, 'clamp': 2.0},
+                               name=F'coupling_{1}')
+            self.layer4 = Node(self.layer3, PermuteRandom, {'seed': 1}, name=F'permute_{1}')
+            self.out1 = OutputNode(self.layer4, name='output1')
+            self.flow_model = GraphINN([self.in1, self.layer1, self.layer2, self.layer3, self.layer4, self.out1])
+
         self.select = 1
-        self.sample_from = 10000
         self.loss_weight = 0.1
         self.weight_energy = torch.nn.Linear(self.num_classes, 1).cuda()
         torch.nn.init.uniform_(self.weight_energy.weight)
-        self.data_dict = torch.zeros(self.num_classes, self.sample_number, 1024).cuda()
+        self.data_dict = torch.zeros(self.num_classes, self.sample_number, self.ft_dim).cuda()
         self.number_dict = {}
-        self.eye_matrix = torch.eye(1024, device='cuda')
+        self.eye_matrix = torch.eye(self.ft_dim, device='cuda')
         self.trajectory = torch.zeros((self.num_classes, 900, 3)).cuda()
         for i in range(self.num_classes):
             self.number_dict[i] = 0
         self.cos = torch.nn.MSELoss()  #
+
+        self.box_head_extension = box_head_extension
 
     @classmethod
     def from_config(cls, cfg, input_shape):
         ret = super().from_config(cfg)
         cls.cfg = cfg
         ret["train_on_pred_boxes"] = cfg.MODEL.ROI_BOX_HEAD.TRAIN_ON_PRED_BOXES
-        ret['max_smin_weight_loss'] = cfg.MODEL.ROI_BOX_HEAD.MAX_SMIN_WEIGHT_LOSS
-        ret['smin_learn_style'] = cfg.MODEL.ROI_BOX_HEAD.SMIN_LEARN_STYLE
-        ret['starting_smin_reg_epoch'] = cfg.MODEL.ROI_BOX_HEAD.STARTING_SMIN_REG_EPOCH
+        # ret['starting_smin_reg_epoch'] = cfg.MODEL.ROI_BOX_HEAD.STARTING_SMIN_REG_EPOCH
         # Subclasses that have not been updated to use from_config style construction
         # may have overridden _init_*_head methods. In this case, those overridden methods
         # will not be classmethods and we need to avoid trying to call them here.
@@ -604,12 +622,18 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
         box_head = build_box_head(
             cfg, ShapeSpec(channels=in_channels, height=pooler_resolution, width=pooler_resolution)
         )
-        box_predictor = FastRCNNOutputLayers(cfg, box_head.output_shape)
+        if cfg.NULL_SPACE.RED_DIM > 0:
+            box_head_extension = nn.Linear(box_head.output_shape.channels, cfg.NULL_SPACE.RED_DIM).cuda()
+            box_predictor = FastRCNNOutputLayers(cfg, cfg.NULL_SPACE.RED_DIM)
+        else:
+            box_head_extension = None
+            box_predictor = FastRCNNOutputLayers(cfg, box_head.output_shape)
         return {
             "box_in_features": in_features,
             "box_pooler": box_pooler,
             "box_head": box_head,
             "box_predictor": box_predictor,
+            "box_head_extension": box_head_extension,
         }
 
     @classmethod
@@ -705,15 +729,16 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
             losses.update(self._forward_mask(features, proposals))
             losses.update(self._forward_keypoint(features, proposals))
 
-            if self.max_smin_weight_loss > 0:
-                if iteration >= self.starting_smin_reg_epoch:
-                    smin = torch.linalg.svdvals(self.box_predictor.cls_score.weight)[-1]
-                    if self.smin_learn_style == 'negative':
-                        losses['smin_weight_loss'] = - self.max_smin_weight_loss * smin ** 2
-                    else:
-                        losses['smin_weight_loss'] = self.max_smin_weight_loss * (1 / smin)
+            if self.cfg.NULL_SPACE.SMIN_LOSS_WEIGHT > 0:
+                # if iteration >= self.starting_smin_reg_epoch:
+                s = torch.linalg.svdvals(self.box_predictor.cls_score.weight)
+                if self.cfg.NULL_SPACE.USE_CONDITIONING:
+                    smin_reg_loss = self.cfg.NULL_SPACE.SMIN_LOSS_WEIGHT * (s[0] / s[-1])
                 else:
-                    losses['smin_weight_loss'] = torch.zeros(1).cuda()
+                    smin_reg_loss = self.cfg.NULL_SPACE.SMIN_LOSS_WEIGHT * (1 / s[-1])
+            else:
+                smin_reg_loss = torch.zeros(1).cuda()
+            losses['smin_reg_loss'] = smin_reg_loss
             return proposals, losses
         else:
             pred_instances = self._forward_box(features, proposals)
@@ -746,6 +771,13 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
         instances = self._forward_keypoint(features, instances)
         return instances
 
+    # create flow model
+    def subnet_conv(self, c_in, c_out):
+        return nn.Sequential(nn.Conv1d(c_in, 2048, 3, padding=1), nn.ReLU(), nn.Conv1d(2048, c_out, 3, padding=1))
+
+    def subnet_fc(self, c_in, c_out):
+        return nn.Sequential(nn.Linear(c_in, 2048), nn.ReLU(), nn.Linear(2048, c_out))
+
     def log_sum_exp(self, value, dim=None, keepdim=False):
         """Numerically stable implementation of the operation
         value.exp().sum(dim, keepdim).log()
@@ -767,6 +799,34 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
             # else:
             return m + torch.log(sum_exp)
 
+    def NLLLoss(self, z, sldj):
+        """Negative log-likelihood loss assuming isotropic gaussian with unit norm.
+          Args:
+             k (int or float): Number of discrete values in each input dimension.
+                E.g., `k` is 256 for natural images.
+          See Also:
+              Equation (3) in the RealNVP paper: https://arxiv.org/abs/1605.08803
+        """
+        prior_ll = -0.5 * (z ** 2 + np.log(2 * np.pi))
+        prior_ll = prior_ll.flatten(1).sum(-1) - np.log(256) * np.prod(z.size()[1:])
+        ll = prior_ll + sldj
+        nll = -ll.mean()
+        return nll
+
+    def NLL(self, z, sldj):
+        """Negative log-likelihood loss assuming isotropic gaussian with unit norm.
+          Args:
+             k (int or float): Number of discrete values in each input dimension.
+                E.g., `k` is 256 for natural images.
+          See Also:
+              Equation (3) in the RealNVP paper: https://arxiv.org/abs/1605.08803
+        """
+        prior_ll = -0.5 * (z ** 2 + np.log(2 * np.pi))
+        prior_ll = prior_ll.flatten(1).sum(-1) - np.log(256) * np.prod(z.size()[1:])
+        ll = prior_ll + sldj
+        nll = -ll
+        return nll
+
     def _forward_box(self, features: Dict[str, torch.Tensor], proposals: List[Instances], iteration: int):
         """
         Forward logic of the box prediction branch. If `self.train_on_pred_boxes is True`,
@@ -786,6 +846,9 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
         features = [features[f] for f in self.box_in_features]
         box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
         box_features = self.box_head(box_features)
+        if self.box_head_extension is not None:
+            box_features = self.box_head_extension(box_features)
+            box_features = F.relu(box_features)
 
         predictions = self.box_predictor(box_features)
         # del box_features
@@ -823,55 +886,79 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
                     sum_temp += self.number_dict[index]
                 # print(iteration)
                 lr_reg_loss = torch.zeros(1).cuda()
+                ########################################################################################
+
+                #############################    Flow Feature Synthesis      ###########################
+                ########################################################################################
+                nll_loss = torch.zeros(1).cuda()
                 if sum_temp == self.num_classes * self.sample_number and iteration < self.start_iter:
                     selected_fg_samples = (gt_classes != predictions[0].shape[1] - 1).nonzero().view(-1)
                     indices_numpy = selected_fg_samples.cpu().numpy().astype(int)
                     gt_classes_numpy = gt_classes.cpu().numpy().astype(int)
                     # maintaining an ID data queue for each class.
-                    for index in indices_numpy:
-                        dict_key = gt_classes_numpy[index]
-                        self.data_dict[dict_key] = torch.cat((self.data_dict[dict_key][1:],
-                                                              box_features[index].detach().view(1, -1)), 0)
+                    if self.use_ffs:
+                        z, sldj = self.flow_model(box_features[indices_numpy,].detach().cuda())
+                        nll_loss = self.NLLLoss(z, sldj)
+                    else:
+                        for index in indices_numpy:
+                            dict_key = gt_classes_numpy[index]
+                            self.data_dict[dict_key] = torch.cat((self.data_dict[dict_key][1:],
+                                                                  box_features[index].detach().view(1, -1)), 0)
+
                 elif sum_temp == self.num_classes * self.sample_number and iteration >= self.start_iter:
                     selected_fg_samples = (gt_classes != predictions[0].shape[1] - 1).nonzero().view(-1)
                     indices_numpy = selected_fg_samples.cpu().numpy().astype(int)
                     gt_classes_numpy = gt_classes.cpu().numpy().astype(int)
                     # maintaining an ID data queue for each class.
-                    for index in indices_numpy:
-                        dict_key = gt_classes_numpy[index]
-                        self.data_dict[dict_key] = torch.cat((self.data_dict[dict_key][1:],
-                                                              box_features[index].detach().view(1, -1)), 0)
-                    # the covariance finder needs the data to be centered.
-                    for index in range(self.num_classes):
-                        if index == 0:
-                            X = self.data_dict[index] - self.data_dict[index].mean(0)
-                            mean_embed_id = self.data_dict[index].mean(0).view(1, -1)
-                        else:
-                            X = torch.cat((X, self.data_dict[index] - self.data_dict[index].mean(0)), 0)
-                            mean_embed_id = torch.cat((mean_embed_id,
-                                                       self.data_dict[index].mean(0).view(1, -1)), 0)
+                    if self.use_ffs:
+                        z, sldj = self.flow_model(box_features[indices_numpy,].detach().cuda())
+                        nll_loss = self.NLLLoss(z, sldj)
 
-                    # add the variance.
-                    temp_precision = torch.mm(X.t(), X) / len(X)
-                    # for stable training.
-                    temp_precision += 0.0001 * self.eye_matrix
+                        # randomly sample from latent space of flow model
+                        with torch.no_grad():
+                            z_randn = torch.randn((self.sample_from, self.ft_dim), dtype=torch.float32).cuda()
+                            negative_samples, _ = self.flow_model(z_randn, rev=True)
+                            # negative_samples = torch.sigmoid(negative_samples)
+                            _, sldj_neg = self.flow_model(negative_samples)
+                            nll_neg = self.NLL(z_randn, sldj_neg)
+                            cur_samples, index_prob = torch.topk(nll_neg, self.select)
+                            ood_samples = negative_samples[index_prob].view(1, -1)
+                            # ood_samples = torch.squeeze(ood_samples)
+                            del negative_samples
+                            del z_randn
+                    else:
+                        for index in indices_numpy:
+                            dict_key = gt_classes_numpy[index]
+                            self.data_dict[dict_key] = torch.cat((self.data_dict[dict_key][1:],
+                                                                  box_features[index].detach().view(1, -1)), 0)
+                            # the covariance finder needs the data to be centered.
+                            for index in range(self.num_classes):
+                                if index == 0:
+                                    X = self.data_dict[index] - self.data_dict[index].mean(0)
+                                    mean_embed_id = self.data_dict[index].mean(0).view(1, -1)
+                                else:
+                                    X = torch.cat((X, self.data_dict[index] - self.data_dict[index].mean(0)), 0)
+                                    mean_embed_id = torch.cat((mean_embed_id,
+                                                               self.data_dict[index].mean(0).view(1, -1)), 0)
 
+                            # add the variance.
+                            temp_precision = torch.mm(X.t(), X) / len(X)
+                            # for stable training.
+                            temp_precision += 0.0001 * self.eye_matrix
 
-                    for index in range(self.num_classes):
-                        new_dis = torch.distributions.multivariate_normal.MultivariateNormal(
-                            mean_embed_id[index], covariance_matrix=temp_precision)
-                        negative_samples = new_dis.rsample((self.sample_from,))
-                        prob_density = new_dis.log_prob(negative_samples)
+                            for index in range(self.num_classes):
+                                new_dis = torch.distributions.multivariate_normal.MultivariateNormal(
+                                    mean_embed_id[index], covariance_matrix=temp_precision)
+                                negative_samples = new_dis.rsample((self.sample_from,))
+                                prob_density = new_dis.log_prob(negative_samples)
 
-                        # keep the data in the low density area.
-                        cur_samples, index_prob = torch.topk(- prob_density, self.select)
-                        if index == 0:
-                            ood_samples = negative_samples[index_prob]
-                        else:
-                            ood_samples = torch.cat((ood_samples, negative_samples[index_prob]), 0)
-                        del new_dis
-                        del negative_samples
-
+                                # keep the data in the low density area.
+                                cur_samples, index_prob = torch.topk(- prob_density, self.select)
+                                if index == 0:
+                                    ood_samples = negative_samples[index_prob]
+                                else:
+                                    ood_samples = torch.cat((ood_samples, negative_samples[index_prob]), 0)
+                                del new_dis
 
                     if len(ood_samples) != 0:
                         # add some gaussian noise
@@ -922,27 +1009,17 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
             else:
                 proposal_boxes = gt_boxes = torch.empty((0, 4), device=proposal_deltas.device)
 
-            if sum_temp == self.num_classes * self.sample_number:
-                losses = {
-                    "loss_cls": cross_entropy(scores, gt_classes, reduction="mean"),
-                    "lr_reg_loss": self.loss_weight * lr_reg_loss,
-                    "loss_dummy": loss_dummy,
-                    "loss_dummy1": loss_dummy1,
-                    "loss_box_reg": self.box_predictor.box_reg_loss(
-                        proposal_boxes, gt_boxes, proposal_deltas, gt_classes
-                    ),
-                }
-            else:
-                losses = {
-                    "loss_cls": cross_entropy(scores, gt_classes, reduction="mean"),
-                    "lr_reg_loss":torch.zeros(1).cuda(),
-                    "loss_dummy": loss_dummy,
-                    "loss_dummy1": loss_dummy1,
-                    "loss_box_reg": self.box_predictor.box_reg_loss(
-                        proposal_boxes, gt_boxes, proposal_deltas, gt_classes
-                    ),
-                }
-            losses =  {k: v * self.box_predictor.loss_weight.get(k, 1.0) for k, v in losses.items()}
+            # if sum_temp == self.num_classes * self.sample_number:
+            losses = {
+                "loss_cls": cross_entropy(scores, gt_classes, reduction="mean"),
+                "lr_reg_loss": self.loss_weight * lr_reg_loss,
+                "loss_box_reg": self.box_predictor.box_reg_loss(proposal_boxes, gt_boxes, proposal_deltas, gt_classes),
+                "loss_nll": 1e-4 * nll_loss,
+                "loss_dummy": loss_dummy,
+                "loss_dummy1": loss_dummy1,
+            }
+
+            losses = {k: v * self.box_predictor.loss_weight.get(k, 1.0) for k, v in losses.items()}
 
             # proposals is modified in-place below, so losses must be computed first.
             if self.train_on_pred_boxes:
