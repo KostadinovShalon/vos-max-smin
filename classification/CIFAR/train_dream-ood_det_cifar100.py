@@ -274,8 +274,6 @@ def train(epoch):
                 criterion = torch.nn.CrossEntropyLoss()
                 output1 = logistic_regression(input_for_lr.reshape(-1, 1))
                 energy_reg_loss = criterion(output1, binary_labels.long())
-                if energy_reg_loss.detach().item() > 35:
-                    print('heeeeey')
                 loss += args.energy_weight * energy_reg_loss
 
             elif args.score == 'OE':
