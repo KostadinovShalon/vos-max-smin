@@ -12,12 +12,35 @@ import torchvision.transforms as trn
 import torchvision.datasets as dset
 import torch.nn.functional as F
 
-if __package__ is None:
-    import sys
-    from os import path
 
-    sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
-    from utils.validation_dataset import validation_split
+class PartialDataset(torch.utils.data.Dataset):
+    def __init__(self, parent_ds, offset, length):
+        self.parent_ds = parent_ds
+        self.offset = offset
+        self.length = length
+        assert len(parent_ds) >= offset + length, Exception("Parent Dataset not long enough")
+        super(PartialDataset, self).__init__()
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, i):
+        return self.parent_ds[i + self.offset]
+
+
+def validation_split(dataset, val_share=0.1):
+    """
+       Split a (training and vaidation combined) dataset into training and validation.
+       Note that to be statistically sound, the items in the dataset should be statistically
+       independent (e.g. not sorted by class, not several instances of the same dataset that
+       could end up in either set).
+       inputs:
+          dataset:   ("training") dataset to split into training and validation
+          val_share: fraction of validation data (should be 0<val_share<1, default: 0.1)
+       returns: input dataset split into test_ds, val_ds
+    """
+    val_offset = int(len(dataset) * (1 - val_share))
+    return PartialDataset(dataset, 0, val_offset), PartialDataset(dataset, val_offset, len(dataset) - val_offset)
 
 
 parser = argparse.ArgumentParser(description='Tunes a CIFAR Classifier with OE',
@@ -73,11 +96,13 @@ parser.add_argument('--additional_info', type=str, default='')
 parser.add_argument('--energy_weight', type=float, default=1)  # change this to 19.2 if you are using cifar-100.
 parser.add_argument('--seed', type=int, default=1, help='seed for np(tinyimages80M sampling); 1|2|8|100|107')
 
+parser.add_argument('--smin_loss_weight', type=float, default=0.0)
+parser.add_argument('--use_conditioning', action='store_true')
+parser.add_argument('--null_space_red_dim', type=int, default=-1)
 
-parser.add_argument('--id-root', type=str, default='./data/cifarpy')
-parser.add_argument('--ood-root', type=str, default='./data/ dream-ood-cifar-outliers')
+parser.add_argument('--id-root', type=str, default='./data/imagenet-100')
+parser.add_argument('--ood-root', type=str, default='./data/ood_in100')
 args = parser.parse_args()
-
 
 from models.resnet import ResNet_Model
 
@@ -99,15 +124,10 @@ np.random.seed(args.seed)
 mean = [x / 255 for x in [125.3, 123.0, 113.9]]
 std = [x / 255 for x in [63.0, 62.1, 66.7]]
 
-train_transform = trn.Compose([trn.RandomHorizontalFlip(), trn.RandomCrop(32, padding=4),
-                               trn.ToTensor(), trn.Normalize(mean, std)])
-test_transform = trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)])
-
-
-traindir = os.path.join('/nobackup-slow/dataset/my_xfdu/IN100_new/', 'train')
-valdir = os.path.join('/nobackup-slow/dataset/my_xfdu/IN100_new/', 'val')
+traindir = os.path.join(args.id_root, 'train')
+valdir = os.path.join(args.id_root, 'val')
 normalize = trn.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+                          std=[0.229, 0.224, 0.225])
 
 if args.augmix:
     train_data_in = torchvision.datasets.ImageFolder(
@@ -119,7 +139,7 @@ if args.augmix:
             trn.ToTensor(),
             normalize,
         ])
-        )
+    )
 else:
     train_data_in = torchvision.datasets.ImageFolder(
         traindir,
@@ -158,21 +178,16 @@ test_data = torchvision.datasets.ImageFolder(
     ]))
 num_classes = 100
 
-
 calib_indicator = ''
 if args.calibration:
     train_data_in, val_data = validation_split(train_data_in, val_share=0.1)
     calib_indicator = '_calib'
 
-
-
-ood_data = dset.ImageFolder(root="/nobackup-fast/dataset/my_xfdu/sd/txt2img-samples-in100/"  + args.my_info + '/samples',
+ood_data = dset.ImageFolder(root=args.ood_root,
                             transform=trn.Compose([trn.RandomResizedCrop(224),
-trn.RandomHorizontalFlip(),
-trn.ToTensor(),
-normalize,]))
-
-
+                                                   trn.RandomHorizontalFlip(),
+                                                   trn.ToTensor(),
+                                                   normalize, ]))
 
 train_loader_in = torch.utils.data.DataLoader(
     train_data_in,
@@ -191,10 +206,11 @@ test_loader = torch.utils.data.DataLoader(
 
 # Create model
 if args.r50:
-    net = ResNet_Model(name='resnet50', num_classes=num_classes)
+    net = ResNet_Model(name='resnet50', num_classes=num_classes, null_space_red_dim=args.null_space_red_dim)
 else:
-    net = ResNet_Model(name='resnet34', num_classes=num_classes)
-
+    net = ResNet_Model(name='resnet34', num_classes=num_classes, null_space_red_dim=args.null_space_red_dim)
+for p in net.parameters():
+    p.register_hook(lambda grad: torch.clamp(grad, -35, 35))
 
 
 def recursion_change_bn(module):
@@ -206,6 +222,8 @@ def recursion_change_bn(module):
             module1 = recursion_change_bn(module1)
     return module
 
+if args.null_space_red_dim > 0:
+    args.model = f'{args.model}_nsr{args.null_space_red_dim}'
 
 # Restore model
 model_found = False
@@ -217,10 +235,6 @@ if args.load != '':
         del pretrained_weights[item]
     net.load_state_dict(pretrained_weights, strict=True)
 
-
-
-
-
 logistic_regression = torch.nn.DataParallel(torch.nn.Sequential(
     torch.nn.Linear(1, 512),
     torch.nn.ReLU(),
@@ -231,18 +245,17 @@ optimizer = torch.optim.SGD(
     state['learning_rate'], momentum=state['momentum'],
     weight_decay=state['decay'], nesterov=True)
 
+if args.ngpu > 0:
+    net.cuda()
+    torch.cuda.manual_seed(1)
 
 if args.ngpu > 1:
-    net.cuda()
     if args.apex:
         net, optimizer = amp.initialize(net, optimizer, opt_level="O1", loss_scale=1.0)
     net = torch.nn.DataParallel(net, device_ids=list(range(args.ngpu)))
 
-if args.ngpu > 0:
-    torch.cuda.manual_seed(1)
-
-cudnn.benchmark = True  # fire on all cylinders
-
+cudnn.deterministic = True
+cudnn.benchmark = False
 
 def cosine_annealing(step, total_steps, lr_max, lr_min):
     return lr_min + (lr_max - lr_min) * 0.5 * (
@@ -261,20 +274,14 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(
 criterion = torch.nn.CrossEntropyLoss()
 
 
-
-
-
-
-
 def train_permute():
     net.train()  # enter train mode
     loss_avg = 0.0
     loss_energy_avg = 0.0
-
+    smin_loss_avg = 0.0
 
     batch_iterator = iter(train_loader_out)
     for _, in_set in enumerate(train_loader_in):
-
 
         try:
             out_set = next(batch_iterator)
@@ -296,7 +303,6 @@ def train_permute():
         binary_labels[len(in_set[0]):] = 0
         x = net(data[permutation_idx])
 
-
         optimizer.zero_grad()
 
         # cross-entropy from softmax distribution to uniform distribution
@@ -305,32 +311,42 @@ def train_permute():
             loss = F.cross_entropy(x, target)
         else:
             # breakpoint()
-            loss = F.cross_entropy(x[binary_labels[permutation_idx].bool()], fake_target[permutation_idx][binary_labels[permutation_idx].bool()].long())
-            Ec_out = torch.logsumexp(x[(1-binary_labels[permutation_idx]).bool()], dim=1) / args.T
+            loss = F.cross_entropy(x[binary_labels[permutation_idx].bool()],
+                                   fake_target[permutation_idx][binary_labels[permutation_idx].bool()].long())
+            Ec_out = torch.logsumexp(x[(1 - binary_labels[permutation_idx]).bool()], dim=1) / args.T
             Ec_in = torch.logsumexp(x[binary_labels[permutation_idx].bool()], dim=1) / args.T
-
 
             input_for_lr = torch.cat((Ec_in, Ec_out), -1)
             criterion = torch.nn.CrossEntropyLoss()
             # breakpoint()
-            output1 = logistic_regression(input_for_lr.reshape(-1,1))
+            output1 = logistic_regression(input_for_lr.reshape(-1, 1))
             energy_reg_loss = criterion(output1, binary_labels.long())
 
-
             loss += args.energy_weight * energy_reg_loss
+        if args.smin_loss_weight > 0:
+            fcw = net.fc.weight if args.null_space_red_dim <= 0 else net.fc[2].weight
+            smin = torch.linalg.svdvals(fcw)[-1]
+            if args.use_conditioning:
+                smax = torch.linalg.svdvals(fcw)[0]
+                smin_loss = args.smin_loss_weight * (smax / smin)
+            else:
+                smin_loss = args.smin_loss_weight * (1 / smin)
 
-
+            loss += smin_loss
+        else:
+            smin_loss = 0
         loss.backward()
         optimizer.step()
         scheduler.step()
         # exponential moving average
         loss_energy_avg = loss_energy_avg * 0.8 + float(args.energy_weight * energy_reg_loss) * 0.2
+        smin_loss_avg = smin_loss_avg * 0.8 + float(smin_loss) * 0.2
         loss_avg = loss_avg * 0.8 + float(loss) * 0.2
     print(scheduler.get_lr())
     print('loss energy is: ', loss_energy_avg)
     state['train_loss'] = loss_avg
+    state['train_smin_loss'] = smin_loss_avg
     state['train_energy_loss'] = loss_energy_avg
-
 
 
 # test function
@@ -372,7 +388,6 @@ if not os.path.exists(args.save):
 if not os.path.isdir(args.save):
     raise Exception('%s is not a dir' % args.save)
 
-
 save_info = save_info + "_slope_" + str(args.add_slope) + '_' + "weight_" + str(args.energy_weight)
 save_info = save_info + '_' + args.my_info + '_' + args.additional_info
 
@@ -390,33 +405,41 @@ for epoch in range(0, args.epochs):
     begin_epoch = time.time()
     train_permute()
     test()
-
-
-    torch.save(net.state_dict(),
-               os.path.join(args.save, args.dataset + calib_indicator + '_' + args.model + '_s' + str(args.seed) +
-                            '_' + save_info + '_epoch_' + str(epoch) + '.pt'))
+    model_name = args.dataset + calib_indicator + '_' + args.model + '_s' + str(args.seed) + \
+                 '_' + save_info
+    if args.smin_loss_weight > 0:
+        model_name += f'_smin{args.smin_loss_weight}_cond{args.use_conditioning}'
+    model_name += '_epoch_'
+    prev_path = model_name + str(epoch - 1) + '.pt'
+    model_name = model_name + str(epoch) + '.pt'
+    torch.save(net.state_dict(), os.path.join(args.save, model_name))
 
     # Let us not waste space and delete the previous model
-    prev_path = os.path.join(args.save, args.dataset + calib_indicator + '_' + args.model + '_s' + str(args.seed) +
-                             '_' + save_info + '_epoch_' + str(epoch - 1) + '.pt')
-    if os.path.exists(prev_path): os.remove(prev_path)
+    torch.save(net.state_dict(), os.path.join(args.save, model_name))
+    if os.path.exists(prev_path):
+        os.remove(prev_path)
 
     # Show results
     with open(os.path.join(args.save, args.dataset + calib_indicator + '_' + args.model + '_s' + str(args.seed) +
-                                      '_' + save_info + '_training_results.csv'), 'a') as f:
-        f.write('%03d,%05d,%0.6f,%0.5f,%0.2f\n' % (
+                                      '_' + save_info + f'_smin{args.smin_loss_weight}_cond{args.use_conditioning}' +
+                                      '_training_results.csv'), 'a') as f:
+        f.write('%03d,%05d,%0.6f,%0.6f,%0.6f,%0.5f,%0.2f\n' % (
             (epoch + 1),
             time.time() - begin_epoch,
             state['train_loss'],
+            state['train_smin_loss'],
+            state['train_energy_loss'],
             state['test_loss'],
             100 - 100. * state['test_accuracy'],
         ))
 
-
-    print('Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Test Loss {3:.3f} | Test Error {4:.2f}'.format(
-        (epoch + 1),
-        int(time.time() - begin_epoch),
-        state['train_loss'],
-        state['test_loss'],
-        100 - 100. * state['test_accuracy'])
+    print(
+        'Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Train Smin Loss {3:.4f} | Train Energy Loss {4:.4f} | Test Loss {5:.3f} | Test Error {6:.2f}'.format(
+            (epoch + 1),
+            int(time.time() - begin_epoch),
+            state['train_loss'],
+            state['train_smin_loss'],
+            state['train_energy_loss'],
+            state['test_loss'],
+            100 - 100. * state['test_accuracy'])
     )
