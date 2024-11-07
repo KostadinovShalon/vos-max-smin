@@ -281,8 +281,8 @@ def train_permute():
     smin_loss_avg = 0.0
 
     batch_iterator = iter(train_loader_out)
-    for _, in_set in enumerate(train_loader_in):
-
+    for i, in_set in enumerate(train_loader_in):
+        print(f'{i}/{len(train_loader_in)}')
         try:
             out_set = next(batch_iterator)
         except StopIteration:
