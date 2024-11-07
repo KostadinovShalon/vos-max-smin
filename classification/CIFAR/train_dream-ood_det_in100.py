@@ -124,8 +124,8 @@ np.random.seed(args.seed)
 mean = [x / 255 for x in [125.3, 123.0, 113.9]]
 std = [x / 255 for x in [63.0, 62.1, 66.7]]
 
-traindir = os.path.join(args.id_root, 'train')
-valdir = os.path.join(args.id_root, 'val')
+traindir = os.path.join(args.id_root)
+valdir = os.path.join(args.id_root)
 normalize = trn.Normalize(mean=[0.485, 0.456, 0.406],
                           std=[0.229, 0.224, 0.225])
 
@@ -233,7 +233,7 @@ if args.load != '':
     for item in list(pretrained_weights.keys()):
         pretrained_weights[item[7:]] = pretrained_weights[item]
         del pretrained_weights[item]
-    net.load_state_dict(pretrained_weights, strict=True)
+    net.load_state_dict(pretrained_weights, strict=False)
 
 logistic_regression = torch.nn.DataParallel(torch.nn.Sequential(
     torch.nn.Linear(1, 512),
@@ -282,7 +282,7 @@ def train_permute():
 
     batch_iterator = iter(train_loader_out)
     for _, in_set in enumerate(train_loader_in):
-
+        print(_)
         try:
             out_set = next(batch_iterator)
         except StopIteration:
