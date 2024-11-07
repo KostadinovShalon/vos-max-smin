@@ -931,34 +931,35 @@ class ROIHeadsLogisticGMMNew(ROIHeads):
                             dict_key = gt_classes_numpy[index]
                             self.data_dict[dict_key] = torch.cat((self.data_dict[dict_key][1:],
                                                                   box_features[index].detach().view(1, -1)), 0)
-                            # the covariance finder needs the data to be centered.
-                            for index in range(self.num_classes):
-                                if index == 0:
-                                    X = self.data_dict[index] - self.data_dict[index].mean(0)
-                                    mean_embed_id = self.data_dict[index].mean(0).view(1, -1)
-                                else:
-                                    X = torch.cat((X, self.data_dict[index] - self.data_dict[index].mean(0)), 0)
-                                    mean_embed_id = torch.cat((mean_embed_id,
-                                                               self.data_dict[index].mean(0).view(1, -1)), 0)
+                        # the covariance finder needs the data to be centered.
+                        for index in range(self.num_classes):
+                            if index == 0:
+                                X = self.data_dict[index] - self.data_dict[index].mean(0)
+                                mean_embed_id = self.data_dict[index].mean(0).view(1, -1)
+                            else:
+                                X = torch.cat((X, self.data_dict[index] - self.data_dict[index].mean(0)), 0)
+                                mean_embed_id = torch.cat((mean_embed_id,
+                                                           self.data_dict[index].mean(0).view(1, -1)), 0)
 
-                            # add the variance.
-                            temp_precision = torch.mm(X.t(), X) / len(X)
-                            # for stable training.
-                            temp_precision += 0.0001 * self.eye_matrix
+                        # add the variance.
+                        temp_precision = torch.mm(X.t(), X) / len(X)
+                        # for stable training.
+                        temp_precision += 0.0001 * self.eye_matrix
 
-                            for index in range(self.num_classes):
-                                new_dis = torch.distributions.multivariate_normal.MultivariateNormal(
-                                    mean_embed_id[index], covariance_matrix=temp_precision)
-                                negative_samples = new_dis.rsample((self.sample_from,))
-                                prob_density = new_dis.log_prob(negative_samples)
+                        for index in range(self.num_classes):
+                            new_dis = torch.distributions.multivariate_normal.MultivariateNormal(
+                                mean_embed_id[index], covariance_matrix=temp_precision)
+                            negative_samples = new_dis.rsample((self.sample_from,))
+                            prob_density = new_dis.log_prob(negative_samples)
 
-                                # keep the data in the low density area.
-                                cur_samples, index_prob = torch.topk(- prob_density, self.select)
-                                if index == 0:
-                                    ood_samples = negative_samples[index_prob]
-                                else:
-                                    ood_samples = torch.cat((ood_samples, negative_samples[index_prob]), 0)
-                                del new_dis
+                            # keep the data in the low density area.
+                            cur_samples, index_prob = torch.topk(- prob_density, self.select)
+                            if index == 0:
+                                ood_samples = negative_samples[index_prob]
+                            else:
+                                ood_samples = torch.cat((ood_samples, negative_samples[index_prob]), 0)
+                            del new_dis
+                            del negative_samples
 
                     if len(ood_samples) != 0:
                         # add some gaussian noise
