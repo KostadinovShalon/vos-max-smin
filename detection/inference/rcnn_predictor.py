@@ -10,7 +10,7 @@ from detectron2.structures import Boxes, Instances, pairwise_iou
 from inference import inference_utils
 from inference.inference_core import ProbabilisticPredictor
 from modeling.modeling_utils import covariance_output_to_cholesky, clamp_log_variance
-
+import torch.nn.functional as F
 
 class GeneralizedRcnnPlainPredictor(ProbabilisticPredictor):
     def __init__(self, cfg):
@@ -111,6 +111,9 @@ class GeneralizedRcnnPlainPredictor(ProbabilisticPredictor):
             features = [features[f] for f in self.model.roi_heads.box_in_features]
             box_features = self.model.roi_heads.box_pooler(features, [x.proposal_boxes for x in proposals])
             box_features = self.model.roi_heads.box_head(box_features)
+            if self.model.roi_heads.box_head_extension is not None:
+                box_features = self.model.roi_heads.box_head_extension(box_features)
+                box_features = F.relu(box_features)
             predictions = self.model.roi_heads.box_predictor(box_features)
 
 
