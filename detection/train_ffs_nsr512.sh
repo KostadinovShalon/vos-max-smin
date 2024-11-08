@@ -1,0 +1,9 @@
+python train_net_gmm.py --dataset-dir $1 --num-gpus $2 --config-file VOC-Detection/faster-rcnn/ffs_nsr_512.yaml --random-seed 1
+python train_net_gmm.py --dataset-dir $1 --num-gpus $2 --config-file VOC-Detection/faster-rcnn/ffs_nsr_512_smin0.001.yaml --random-seed 1
+python train_net_gmm.py --dataset-dir $1 --num-gpus $2 --config-file VOC-Detection/faster-rcnn/ffs_nsr_512_smin0.01.yaml --random-seed 1
+python train_net_gmm.py --dataset-dir $1 --num-gpus $2 --config-file VOC-Detection/faster-rcnn/ffs_nsr_512_smin0.1.yaml --random-seed 1
+python train_net_gmm.py --dataset-dir $1 --num-gpus $2 --config-file VOC-Detection/faster-rcnn/ffs_nsr_512_smin1.0.yaml --random-seed 1
+python train_net_gmm.py --dataset-dir $1 --num-gpus $2 --config-file VOC-Detection/faster-rcnn/ffs_nsr_512_smin0.001_cond.yaml --random-seed 1
+python train_net_gmm.py --dataset-dir $1 --num-gpus $2 --config-file VOC-Detection/faster-rcnn/ffs_nsr_512_smin0.01_cond.yaml --random-seed 1
+python train_net_gmm.py --dataset-dir $1 --num-gpus $2 --config-file VOC-Detection/faster-rcnn/ffs_nsr_512_smin0.1_cond.yaml --random-seed 1
+python train_net_gmm.py --dataset-dir $1 --num-gpus $2 --config-file VOC-Detection/faster-rcnn/ffs_nsr_512_smin1.0_cond.yaml --random-seed 1
