@@ -282,7 +282,6 @@ def train_permute():
 
     batch_iterator = iter(train_loader_out)
     for i, in_set in enumerate(train_loader_in):
-        print(f'{i}/{len(train_loader_in)}')
         try:
             out_set = next(batch_iterator)
         except StopIteration:
